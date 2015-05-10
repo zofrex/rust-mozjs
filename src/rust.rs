@@ -89,6 +89,40 @@ impl Runtime {
     pub fn cx(&self) -> *mut JSContext {
         self.cx.ptr
     }
+
+    pub fn evaluate_script(&self, global: *mut JSObject, script: String,
+                           filename: String, line_num: usize)
+                           -> Result<(), ()> {
+        let script_utf16: Vec<u16> = script.utf16_units().collect();
+        let filename_cstr = ffi::CString::new(filename.as_bytes()).unwrap();
+        debug!("Evaluating script from {} with content {}", filename, script);
+
+        // SpiderMonkey does not approve of null pointers.
+        let (ptr, len) = if script_utf16.len() == 0 {
+            static empty: &'static [u16] = &[];
+            (empty.as_ptr(), 0)
+        } else {
+            (script_utf16.as_ptr(), script_utf16.len() as c_uint)
+        };
+        assert!(!ptr.is_null());
+
+        let mut rval: JSVal = NullValue();
+        let result = unsafe {
+            JS_EvaluateUCScript(self.cx(), global, ptr, len,
+                                filename_cstr.as_ptr(), line_num as c_uint,
+                                &mut rval)
+        };
+
+        if result == ERR {
+            debug!("...err!");
+            Err(())
+        } else {
+            // we could return the script result but then we'd have
+            // to root it and so forth and, really, who cares?
+            debug!("...ok!");
+            Ok(())
+        }
+    }
 }
 
 pub type rt = rc::Rc<rt_rsrc>;
@@ -121,37 +155,6 @@ impl Drop for Cx {
     }
 }
 
-impl Cx {
-    pub fn evaluate_script(&self, glob: *mut JSObject, script: String, filename: String, line_num: usize)
-                    -> Result<(),()> {
-        let script_utf16: Vec<u16> = script.utf16_units().collect();
-        let filename_cstr = ffi::CString::new(filename.as_bytes()).unwrap();
-        let mut rval: JSVal = NullValue();
-        debug!("Evaluating script from {} with content {}", filename, script);
-        // SpiderMonkey does not approve of null pointers.
-        let (ptr, len) = if script_utf16.len() == 0 {
-            static empty: &'static [u16] = &[];
-            (empty.as_ptr(), 0)
-        } else {
-            (script_utf16.as_ptr(), script_utf16.len() as c_uint)
-        };
-        assert!(!ptr.is_null());
-        unsafe {
-            if ERR == JS_EvaluateUCScript(self.ptr, glob, ptr, len,
-                                          filename_cstr.as_ptr(), line_num as c_uint,
-                                          &mut rval) {
-                debug!("...err!");
-                Err(())
-            } else {
-                // we could return the script result but then we'd have
-                // to root it and so forth and, really, who cares?
-                debug!("...ok!");
-                Ok(())
-            }
-        }
-    }
-}
-
 pub unsafe extern fn reportError(_cx: *mut JSContext, msg: *const c_char, report: *mut JSErrorReport) {
     let fnptr = (*report).filename;
     let fname = if !fnptr.is_null() {
@@ -177,11 +180,46 @@ pub fn with_compartment<R, F: FnMut() -> R>(cx: *mut JSContext, object: *mut JSO
 
 #[cfg(test)]
 pub mod test {
+    use {JSCLASS_IS_GLOBAL, JSCLASS_GLOBAL_SLOT_COUNT};
+    use {JSCLASS_RESERVED_SLOTS_MASK, JSCLASS_RESERVED_SLOTS_SHIFT};
     use super::Runtime;
+    use jsapi::JSClass;
+    use jsapi::{JS_NewGlobalObject, JS_PropertyStub, JS_StrictPropertyStub};
+    use jsapi::{JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub};
+
+    use libc;
+
+    use std::ptr;
 
     #[test]
     pub fn dummy() {
-        let _rt = Runtime::new();
+        const CLASS_NAME: &'static [u8; 7] = b"Global\0";
+        static CLASS: JSClass = JSClass {
+            name: CLASS_NAME as *const u8 as *const libc::c_char,
+            flags: JSCLASS_IS_GLOBAL | (((JSCLASS_GLOBAL_SLOT_COUNT) & JSCLASS_RESERVED_SLOTS_MASK) << JSCLASS_RESERVED_SLOTS_SHIFT),
+                // JSCLASS_HAS_RESERVED_SLOTS(JSCLASS_GLOBAL_SLOT_COUNT),
+            addProperty: Some(JS_PropertyStub),
+            delProperty: Some(JS_PropertyStub),
+            getProperty: Some(JS_PropertyStub),
+            setProperty: Some(JS_StrictPropertyStub),
+            enumerate: Some(JS_EnumerateStub),
+            resolve: Some(JS_ResolveStub),
+            convert: Some(JS_ConvertStub),
+            finalize: None,
+            checkAccess: None,
+            call: None,
+            hasInstance: None,
+            construct: None,
+            trace: None,
+
+            reserved: [0 as *mut libc::c_void; 40]
+        };
+
+        let rt = Runtime::new();
+        let global = unsafe {
+            JS_NewGlobalObject(rt.cx(), &CLASS, ptr::null_mut())
+        };
+        assert!(rt.evaluate_script(global, "1 + 1".to_owned(), "test".to_owned(), 1).is_ok());
     }
 
 }
